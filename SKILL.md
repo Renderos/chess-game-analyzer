@@ -1,0 +1,259 @@
+---
+name: "chess-game-analyzer"
+description: "Analiza partidas de ajedrez (PGN o jugadas) con Stockfish: comenta y clasifica cada jugada y publica una animación interactiva del tablero. Úsala cuando pidan analizar o animar una partida."
+---
+
+# Analizador de partidas de ajedrez
+
+Convierte una partida (PGN o jugadas en notación algebraica) en una página web animada con:
+tablero con piezas que se deslizan, barra y gráfica de evaluación, comentario en español para
+**cada** jugada, clasificación por calidad, jugada preferida del motor y resumen por jugador.
+
+## Flujo
+
+1. **Preparar entorno**
+   ```bash
+   pip install chess --break-system-packages -q
+   which stockfish || apt-get install -y stockfish || (apt-get update -q && apt-get install -y stockfish)
+   ```
+   Si Stockfish no se puede instalar, valida con python-chess, clasifica a criterio propio
+   y dilo claramente al usuario (sin motor no hay evaluaciones exactas).
+
+2. **Guardar la partida** en `partida.pgn` (acepta texto con o sin números de jugada).
+   Escribe `analyze.py`, `build.py` y `template.html` (abajo) en el directorio de trabajo.
+
+3. **Analizar**: `python3 analyze.py partida.pgn moves.json 20`
+   Valida legalidad (falla si hay jugada ilegal → avisa al usuario cuál) y muestra por jugada:
+   evaluación, jugada del motor, pérdida de % de victoria y línea principal.
+
+4. **Clasificar** (auto en build.py por pérdida de % de victoria del que mueve):
+   | Clase | Criterio |
+   |---|---|
+   | `mejor` | coincide con el motor |
+   | `excelente` | pérdida < 2 |
+   | `buena` | < 5 |
+   | `imprecision` | < 10 |
+   | `error` | < 20 |
+   | `grave` | ≥ 20 |
+
+   **Overrides manuales** (en notes.json con `"cls"`), porque el % satura en posiciones decididas:
+   - `teoria`: jugadas de apertura conocida (normalmente las primeras 3–7 por bando) si no son errores claros.
+   - `gran`: tácticas destacadas que son la mejor jugada (jaque doble, sacrificio ganador). Úsalo con moderación.
+   - Sube a `error`/`grave` jugadas que en posición ya perdida regalan material grande (salto de eval > ~3 peones)
+     o **permiten un mate forzado** cuando había defensa.
+   - Marca `error` cuando se **pierde un mate en una** (o un mate corto) aunque siga ganando.
+   - La jugada de mate final = `mejor`.
+   - Revisa siempre mates en una no vistos (`best` termina en `#`) y destácalos en comentarios y claves.
+
+5. **Comentar cada jugada** en `notes.json` (`{"1": {"note": "...", "cls": "..."}}`):
+   - 1–2 frases breves, en español, explicando la idea; si no fue la mejor, nombra la alternativa del motor
+     y por qué (ej. "Con 9.c3 la dama quedaba sin casillas").
+   - Usa notación SAN inglesa (N, B, R, Q, K) igual que la partida.
+   - **Verifica con python-chess** cualquier afirmación concreta (qué casillas controla cada pieza en el mate,
+     diagonales vs columnas, piezas colgando) antes de escribirla.
+
+6. **Meta** en `meta.json`: `title` (pestaña), `h1` (titular con gancho, ej. "El mate que nadie vio · 1-0 en 21 jugadas"),
+   `keys_html` (3–4 `<p><b>Fase:</b> …</p>`: apertura, momento decisivo, errores clave, final).
+
+7. **Construir**: `python3 build.py moves.json notes.json meta.json template.html partida.html`
+
+8. **Verificar**: extrae el `<script>` y pásalo por `node --check`; si hay Playwright, toma capturas en
+   una jugada intermedia y en el mate para revisar visualmente.
+
+9. **Publicar** como artifact (página HTML hecha a mano; leer la guía `pages` antes del primer publish de la sesión).
+   Título igual a `title`.
+
+10. **Responder brevemente**: momentos clave (3–4 bullets), recuento de errores por bando y una línea sobre
+    cómo se clasificó (motor + overrides).
+
+## analyze.py
+```python
+# Uso: python3 analyze.py partida.pgn moves.json [profundidad]
+import chess, chess.pgn, chess.engine, io, json, math, sys, shutil
+pgn = open(sys.argv[1]).read(); out_path = sys.argv[2]
+depth = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+g = chess.pgn.read_game(io.StringIO(pgn)); b = g.board()
+eng_path = shutil.which('stockfish') or '/usr/games/stockfish'
+eng = chess.engine.SimpleEngine.popen_uci(eng_path); eng.configure({'Threads': 4, 'Hash': 256})
+L = chess.engine.Limit(depth=depth)
+V = {1: 1, 2: 3, 3: 3, 4: 5, 5: 9, 6: 0}
+mat = lambda b: sum(V[p.piece_type] * (1 if p.color else -1) for p in b.piece_map().values())
+wcp = lambda info: info['score'].white().score(mate_score=10000)
+wp = lambda cp: 50 + 50 * (2 / (1 + math.exp(-0.00368208 * cp)) - 1)
+info = eng.analyse(b, L); prev = wcp(info); best = info['pv'][0]
+out = [{'fen': b.board_fen(), 'san': None, 'mat': 0, 'ev': prev}]
+for m in g.mainline_moves():
+    white = b.turn; san = b.san(m); bestsan = b.san(best); bestpv = b.variation_san(info['pv'][:5])
+    frm, to = m.from_square, m.to_square
+    b.push(m)
+    if b.is_game_over():
+        cur = (10000 if white else -10000) if b.is_checkmate() else 0
+    else:
+        info = eng.analyse(b, L); cur = wcp(info); best = info['pv'][0]
+    s = 1 if white else -1
+    out.append({'fen': b.board_fen(), 'san': san, 'from': chess.square_name(frm), 'to': chess.square_name(to),
+                'mat': mat(b), 'check': b.is_check(), 'ev': cur, 'best': bestsan, 'bestpv': bestpv,
+                'isbest': san == bestsan, 'loss': round(wp(prev * s) - wp(cur * s), 1), 'prev': prev})
+    prev = cur
+eng.quit()
+json.dump(out, open(out_path, 'w'))
+for i, o in enumerate(out[1:], 1):
+    print(i, o['san'], 'ev', o['ev'], 'mejor', o['best'], 'pérdida', o['loss'], '|', o['bestpv'])
+```
+
+## build.py
+```python
+# Uso: python3 build.py moves.json notes.json meta.json template.html salida.html
+# notes.json: {"1": {"note": "...", "cls": "teoria"}, ...}  (cls opcional = override)
+# meta.json:  {"title": "...", "h1": "...", "keys_html": "<p><b>Apertura:</b> ...</p>..."}
+import json, sys
+D = json.load(open(sys.argv[1])); notes = json.load(open(sys.argv[2])); meta = json.load(open(sys.argv[3]))
+def auto(d):
+    if d['isbest']: return 'mejor'
+    l = d['loss']
+    return 'excelente' if l < 2 else 'buena' if l < 5 else 'imprecision' if l < 10 else 'error' if l < 20 else 'grave'
+for i, d in enumerate(D[1:], 1):
+    n = notes.get(str(i), {})
+    d['cls'] = n.get('cls') or auto(d); d['note'] = n.get('note', '')
+t = open(sys.argv[4]).read()
+t = (t.replace('__DATA__', json.dumps(D, ensure_ascii=False)).replace('__TITLE__', meta['title'])
+      .replace('__H1__', meta['h1']).replace('__KEYS__', meta['keys_html']))
+open(sys.argv[5], 'w').write(t)
+from collections import Counter
+for c, name in ((1, 'Blancas'), (0, 'Negras')):
+    print(name, dict(Counter(d['cls'] for i, d in enumerate(D[1:], 1) if i % 2 == c)))
+```
+
+## template.html
+Plantilla completa (placeholders: `__TITLE__`, `__H1__`, `__KEYS__`, `__DATA__`). Cópiala tal cual.
+```html
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f4f1ea;--ink:#1d1b18;--mut:#6d675d;--card:#fffdf8;--line:#e2dccf;--lt:#ecdcbc;--dk:#b08a5a;--acc:#c2410c;--hl:rgba(234,179,8,.45)}
+@media (prefers-color-scheme:dark){:root{--bg:#16140f;--ink:#efe9dd;--mut:#a39b8c;--card:#211e18;--line:#353027;--lt:#cdb991;--dk:#8a6a44;--acc:#fb923c}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}
+.wrap{max-width:1060px;margin:0 auto;padding:28px 18px 40px}
+h1{font:600 clamp(24px,4vw,34px)/1.15 Fraunces,serif;margin:0 0 4px}
+.sub{color:var(--mut);margin:0 0 22px}
+.grid{display:grid;grid-template-columns:minmax(0,520px) minmax(0,1fr);gap:24px;align-items:start}
+@media(max-width:860px){.grid{grid-template-columns:1fr}}
+.board{position:relative;width:100%;aspect-ratio:1;border-radius:6px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+.sq{position:absolute;width:12.5%;height:12.5%}
+.sq.l{background:var(--lt)}.sq.d{background:var(--dk)}
+.sq.hl::after{content:"";position:absolute;inset:0;background:var(--hl)}
+.sq.chk{background:radial-gradient(circle,#ef4444 0,rgba(239,68,68,.5) 45%,transparent 75%)!important}
+.coord{position:absolute;font-size:10px;font-weight:600;opacity:.7;pointer-events:none}
+.pc{position:absolute;width:12.5%;height:12.5%;display:flex;align-items:center;justify-content:center;font-size:min(9.2vw,50px);line-height:1;transition:transform .45s cubic-bezier(.4,.1,.2,1);user-select:none;z-index:2}
+.pc.w{color:#fff;text-shadow:0 0 1px #000,0 0 2px #000,0 2px 3px rgba(0,0,0,.4)}
+.pc.b{color:#111;text-shadow:0 0 1px #fff8,0 2px 3px rgba(0,0,0,.3)}
+.pc.moving{z-index:5}
+.pc.gone{opacity:0;transition:opacity .3s}
+.ctrl{display:flex;gap:8px;align-items:center;margin:14px 0 6px;flex-wrap:wrap}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:7px 12px;cursor:pointer;min-width:42px}
+button:hover{border-color:var(--acc)}button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+select{font:inherit;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:6px}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+.card h2{font:600 13px Inter;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin:0 0 8px}
+#now{font:600 22px Fraunces,serif;margin:0 0 6px}
+#note{min-height:66px;margin:0}
+.moves{display:grid;grid-template-columns:34px 1fr 1fr;gap:2px 6px;max-height:260px;overflow:auto;font-variant-numeric:tabular-nums}
+.moves span{padding:2px 6px;border-radius:5px;cursor:pointer}.moves .n{color:var(--mut);cursor:default}
+.moves span.on{background:var(--acc);color:#fff}
+svg text{fill:var(--mut);font-size:10px}
+.key p{margin:0 0 8px}
+.bw{display:flex;gap:10px}.evbar{width:30px;border-radius:5px;overflow:hidden;background:#2b2722;border:1px solid #0004;position:relative;flex:none}
+.evbar i{position:absolute;left:0;right:0;bottom:0;background:#fff;transition:height .45s}
+.evbar b{position:absolute;left:0;right:0;font:600 8.5px Inter;text-align:center;color:#ccc;z-index:1}
+.bwrap{flex:1}
+.badge{display:inline-flex;align-items:center;gap:5px;font:600 12px Inter;padding:3px 9px;border-radius:99px;color:#fff;vertical-align:middle;margin-left:8px}
+.c-teoria{background:#8b6f4e}.c-gran{background:#0e7490}.c-mejor{background:#15803d}.c-excelente{background:#4d9a3a}.c-buena{background:#77a35a}.c-imprecision{background:#d4a017}.c-error{background:#e8710a}.c-grave{background:#c62828}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:1px}
+.eng{font-size:13px;color:var(--mut);margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+.eng b{color:var(--ink)}
+.moves span .dot{width:7px;height:7px;margin-right:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:4px 6px;border-bottom:1px solid var(--line);text-align:left}td.n,th.n{text-align:center;font-variant-numeric:tabular-nums}
+.sqmark{position:absolute;width:12.5%;height:12.5%;z-index:6;pointer-events:none;display:flex;justify-content:flex-end;align-items:flex-start}
+.sqmark span{width:38%;height:38%;margin:-6% -6% 0 0;border-radius:50%;color:#fff;font:700 clamp(8px,1.6vw,12px) Inter;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+</style></head><body><div class="wrap">
+<h1>__H1__</h1>
+<p class="sub">Analizada con Stockfish. Cada jugada lleva comentario, clasificación y la alternativa del motor.</p>
+<div class="grid">
+<div>
+<div class="bw"><div class="evbar"><b style="top:3px" id="evt"></b><i id="evi"></i><b style="bottom:3px;color:#555" id="evb"></b></div><div class="bwrap"><div class="board" id="board"></div></div></div>
+<div class="ctrl">
+<button onclick="go(0)" title="Inicio">⏮</button><button onclick="step(-1)" title="Atrás">◀</button>
+<button class="pri" id="play" onclick="toggle()">▶ Reproducir</button>
+<button onclick="step(1)" title="Adelante">▶</button><button onclick="go(N)" title="Final">⏭</button>
+<select id="spd"><option value="2200">Lento</option><option value="1400" selected>Normal</option><option value="700">Rápido</option></select>
+</div>
+<input type="range" id="slider" min="0" value="0" oninput="go(+this.value)">
+<div class="card" style="margin-top:12px;padding:12px 14px"><h2>Evaluación del motor (en peones, + = ventaja blanca)</h2><svg id="chart" viewBox="0 0 500 120" width="100%"></svg></div>
+</div>
+<div>
+<div class="card"><h2>Jugada actual</h2><p id="now">Posición inicial</p><p id="note"></p><div class="eng" id="eng"></div></div>
+<div class="card"><h2>Movimientos</h2><div class="moves" id="moves"></div></div>
+<div class="card key"><h2>Resumen por jugador</h2><table id="sum"></table></div>
+<div class="card key"><h2>Claves de la partida</h2>
+__KEYS__
+</div>
+</div></div></div>
+<script>
+const D=__DATA__;const N=D.length-1;
+const CL={teoria:["Teoría","📖"],gran:["Gran jugada","!!"],mejor:["Mejor","★"],excelente:["Excelente","!"],buena:["Buena","✓"],imprecision:["Imprecisión","?!"],error:["Error","?"],grave:["Error grave","??"]};
+const ORDER=["teoria","gran","mejor","excelente","buena","imprecision","error","grave"];
+const fmt=v=>Math.abs(v)>=9000?(v>0?"M":"-M")+(10000-Math.abs(v)||"#"):(v>0?"+":"")+(v/100).toFixed(2);
+const G={K:'♚',Q:'♛',R:'♜',B:'♝',N:'♞',P:'♟'};
+const board=document.getElementById('board');let cur=0,timer=null,pieces={};
+const xy=s=>[s.charCodeAt(0)-97,8-(+s[1])];
+const pos=s=>{const[x,y]=xy(s);return `translate(${x*100}%,${y*100}%)`};
+const sqEls={};
+for(let r=0;r<8;r++)for(let f=0;f<8;f++){const s='abcdefgh'[f]+(8-r);const e=document.createElement('div');e.className='sq '+((r+f)%2?'d':'l');e.style.left=f*12.5+'%';e.style.top=r*12.5+'%';board.appendChild(e);sqEls[s]=e;
+ if(f==0){const c=document.createElement('div');c.className='coord';c.textContent=8-r;c.style.left='3px';c.style.top=(r*12.5+.5)+'%';c.style.color=(r+f)%2?'var(--lt)':'var(--dk)';board.appendChild(c)}
+ if(r==7){const c=document.createElement('div');c.className='coord';c.textContent='abcdefgh'[f];c.style.left=`calc(${(f+1)*12.5}% - 10px)`;c.style.bottom='2px';c.style.color=(r+f)%2?'var(--lt)':'var(--dk)';board.appendChild(c)}}
+function parse(fen){const m={};fen.split('/').forEach((row,ri)=>{let f=0;for(const ch of row){if(/\d/.test(ch))f+=+ch;else{m['abcdefgh'[f]+(8-ri)]=ch;f++}}});return m}
+function render(i){Object.values(pieces).forEach(p=>p.remove());pieces={};const m=parse(D[i].fen);
+ for(const s in m){const ch=m[s],e=document.createElement('div');e.className='pc '+(ch===ch.toUpperCase()?'w':'b');e.textContent=G[ch.toUpperCase()];e.style.transition='none';e.style.transform=pos(s);board.appendChild(e);pieces[s]=e;requestAnimationFrame(()=>e.style.transition='')}
+ decorate(i)}
+function decorate(i){Object.values(sqEls).forEach(e=>e.classList.remove('hl','chk'));const d=D[i];
+ if(d.from){sqEls[d.from].classList.add('hl');sqEls[d.to].classList.add('hl')}
+ if(d.check){const m=parse(d.fen);const k=i%2?'k':'K';for(const s in m)if(m[s]===k)sqEls[s].classList.add('chk')}
+ const mv=Math.ceil(i/2);document.getElementById('now').innerHTML=i?`${mv}.${i%2?'':'..'} ${d.san}<span class="badge c-${d.cls}">${CL[d.cls][1]} ${CL[d.cls][0]}</span>`:'Posición inicial';
+ document.getElementById('note').textContent=i?d.note:'Pulsa Reproducir o usa las flechas ← → del teclado.';
+ document.getElementById('eng').innerHTML=i?`Evaluación: <b>${fmt(d.ev)}</b>`+(d.isbest?' · Era la jugada del motor.':` · El motor prefería <b>${d.best}</b> (${fmt(d.prev)}) → ${d.bestpv}`):`Evaluación inicial: <b>${fmt(D[0].ev)}</b>`;
+ const ev=Math.max(-1000,Math.min(1000,d.ev));const h=Math.abs(d.ev)>=9000?(d.ev>0?100:0):50+50*(2/(1+Math.exp(-0.004*ev))-1);document.getElementById('evi').style.height=h+'%';
+ document.getElementById('evt').textContent=d.ev<0?fmt(d.ev):'';document.getElementById('evb').textContent=d.ev>=0?fmt(d.ev):'';
+ document.querySelectorAll('.sqmark').forEach(e=>e.remove());if(i){const[x,y]=xy(d.to);const m=document.createElement('div');m.className='sqmark';m.style.left=x*12.5+'%';m.style.top=y*12.5+'%';m.innerHTML=`<span class="c-${d.cls}">${CL[d.cls][1]}</span>`;board.appendChild(m)}
+ document.getElementById('slider').value=i;document.querySelectorAll('.moves span[data-i]').forEach(e=>e.classList.toggle('on',+e.dataset.i===i));
+ const on=document.querySelector('.moves span.on');if(on)on.scrollIntoView({block:'nearest'});drawMarker(i)}
+function animate(i){const d=D[i];const mover=pieces[d.from];if(!mover){render(i);return}
+ if(pieces[d.to]){pieces[d.to].classList.add('gone')}
+ mover.classList.add('moving');mover.style.transform=pos(d.to);
+ if(d.san.startsWith('O-O')){const w=i%2===1,r=w?'1':'8',long=d.san.startsWith('O-O-O');const rf=(long?'a':'h')+r,rt=(long?'d':'f')+r;if(pieces[rf])pieces[rf].style.transform=pos(rt)}
+ decorate(i);setTimeout(()=>{if(cur===i)render(i)},480)}
+function go(i){i=Math.max(0,Math.min(N,i));if(i===cur+1)animate(i);else render(i);cur=i;if(cur===N)stop()}
+function step(k){stop();go(cur+k)}
+function tick(){if(cur>=N){stop();return}go(cur+1);timer=setTimeout(tick,+document.getElementById('spd').value)}
+function toggle(){timer?stop():(cur>=N&&render(cur=0),document.getElementById('play').textContent='⏸ Pausa',timer=setTimeout(tick,200))}
+function stop(){clearTimeout(timer);timer=null;document.getElementById('play').textContent='▶ Reproducir'}
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')step(1);if(e.key==='ArrowLeft')step(-1);if(e.key===' '){e.preventDefault();toggle()}});
+document.getElementById('slider').max=N;
+const mv=document.getElementById('moves');for(let i=1;i<=N;i+=2){mv.insertAdjacentHTML('beforeend',`<span class="n">${(i+1)/2}.</span>`);for(const j of[i,i+1]){if(j>N){mv.insertAdjacentHTML('beforeend','<span></span>');continue}const s=document.createElement('span');s.dataset.i=j;s.innerHTML=`<i class="dot c-${D[j].cls}"></i>${D[j].san}`;s.title=CL[D[j].cls][0];s.onclick=()=>{stop();go(j)};mv.appendChild(s)}}
+const ch=document.getElementById('chart'),W=500,H=120,P=24,mx=10,X=i=>P+i*(W-P-6)/N,Y=v=>H/2-v*(H/2-10)/mx;
+let path='';D.forEach((d,i)=>path+=(i?'L':'M')+X(i)+' '+Y(Math.max(-10,Math.min(10,d.ev/100))));
+ch.innerHTML=`<line x1="${P}" x2="${W}" y1="${H/2}" y2="${H/2}" stroke="var(--line)"/><text x="2" y="${Y(8)+3}">+8</text><text x="8" y="${H/2+3}">0</text><text x="2" y="${Y(-8)+3}">−8</text>
+<path d="${path}L${X(N)} ${H/2}L${X(0)} ${H/2}Z" fill="var(--acc)" opacity=".15"/><path d="${path}" fill="none" stroke="var(--acc)" stroke-width="2"/><line id="mk" y1="4" y2="${H-4}" stroke="var(--ink)" stroke-dasharray="3 3"/><circle id="mkd" r="4" fill="var(--acc)"/>`;
+ch.onclick=e=>{const r=ch.getBoundingClientRect();stop();go(Math.round(((e.clientX-r.left)/r.width*W-P)/((W-P-6)/N)))};
+function drawMarker(i){const m=document.getElementById('mk');if(!m)return;m.setAttribute('x1',X(i));m.setAttribute('x2',X(i));const c=document.getElementById('mkd');c.setAttribute('cx',X(i));c.setAttribute('cy',Y(Math.max(-10,Math.min(10,D[i].ev/100))))}
+ch.insertAdjacentHTML('beforeend',D.map((d,i)=>['error','grave','gran'].includes(d.cls)?`<circle cx="${X(i)}" cy="${Y(Math.max(-10,Math.min(10,d.ev/100)))}" r="3.5" style="fill:${{error:'#e8710a',grave:'#c62828',gran:'#0e7490'}[d.cls]}"/>`:'').join(''));
+{let h='<tr><th>Clasificación</th><th class="n">Blancas</th><th class="n">Negras</th></tr>';for(const c of ORDER){const w=D.filter((d,i)=>i&&i%2&&d.cls===c).length,b=D.filter((d,i)=>i&&!(i%2)&&d.cls===c).length;h+=`<tr><td><i class="dot c-${c}"></i>${CL[c][1]} ${CL[c][0]}</td><td class="n">${w||'·'}</td><td class="n">${b||'·'}</td></tr>`}document.getElementById('sum').innerHTML=h}
+render(0);
+</script></body></html>
+```
+
+## Limitaciones conocidas
+- Partidas que empiezan desde una posición FEN personalizada o con negras moviendo primero: la numeración y el color del jaque asumen inicio estándar; ajústalo si hace falta.
+- La captura al paso y la coronación se ven bien al final de la animación (se re-renderiza la posición), aunque el deslizamiento no muestre el peón capturado/coronado durante la transición.
